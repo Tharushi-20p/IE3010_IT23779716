@@ -12,6 +12,8 @@
 #define BUFFER_SIZE 1024
 #define NID "7797"
 #define MAX_CLIENTS 20
+#define MAX_ROOMS 10
+#define ROOM_NAME_SIZE 50
 #define USERNAME_SIZE 50
 
 typedef struct
@@ -19,9 +21,17 @@ typedef struct
     int socket;
     char username[USERNAME_SIZE];
     int registered;
+    int room_index;
 } Client;
 
+typedef struct
+{
+    char name[ROOM_NAME_SIZE];
+    int active;
+} Room;
+
 Client clients[MAX_CLIENTS];
+Room rooms[MAX_ROOMS];
 
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -30,9 +40,32 @@ int find_free_slot(void)
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
         if (clients[i].socket == 0)
+            return i;
+    }
+
+    return -1;
+}
+
+int find_room(const char *name)
+{
+    for (int i = 0; i < MAX_ROOMS; i++)
+    {
+        if (rooms[i].active &&
+            strcmp(rooms[i].name, name) == 0)
         {
             return i;
         }
+    }
+
+    return -1;
+}
+
+int find_free_room(void)
+{
+    for (int i = 0; i < MAX_ROOMS; i++)
+    {
+        if (!rooms[i].active)
+            return i;
     }
 
     return -1;
@@ -73,27 +106,16 @@ void *handle_client(void *arg)
     if (bytes_received <= 0)
     {
         close(client_fd);
-
-        pthread_mutex_lock(&clients_mutex);
-
-        clients[index].socket = 0;
-        clients[index].registered = 0;
-        clients[index].username[0] = '\0';
-
-        pthread_mutex_unlock(&clients_mutex);
-
         return NULL;
     }
 
     buffer[bytes_received] = '\0';
 
-    printf("Received from client %d: %s",
-           index + 1,
-           buffer);
-
     char username[USERNAME_SIZE];
 
-    if (sscanf(buffer, "REGISTER %49s", username) == 1)
+    if (sscanf(buffer,
+               "REGISTER %49s",
+               username) == 1)
     {
         int duplicate = 0;
 
@@ -102,7 +124,8 @@ void *handle_client(void *arg)
         for (int i = 0; i < MAX_CLIENTS; i++)
         {
             if (clients[i].registered &&
-                strcmp(clients[i].username, username) == 0)
+                strcmp(clients[i].username,
+                       username) == 0)
             {
                 duplicate = 1;
                 break;
@@ -117,6 +140,7 @@ void *handle_client(void *arg)
 
             clients[index].username[USERNAME_SIZE - 1] = '\0';
             clients[index].registered = 1;
+            clients[index].room_index = -1;
         }
 
         pthread_mutex_unlock(&clients_mutex);
@@ -152,9 +176,7 @@ void *handle_client(void *arg)
                               0);
 
         if (bytes_received <= 0)
-        {
             break;
-        }
 
         buffer[bytes_received] = '\0';
 
@@ -217,18 +239,9 @@ void *handle_client(void *arg)
             char message[BUFFER_SIZE];
 
             strcpy(message, buffer + 6);
-
             message[strcspn(message, "\n")] = '\0';
 
             pthread_mutex_lock(&clients_mutex);
-
-            char sender[USERNAME_SIZE];
-
-            strncpy(sender,
-                    clients[index].username,
-                    USERNAME_SIZE - 1);
-
-            sender[USERNAME_SIZE - 1] = '\0';
 
             for (int i = 0; i < MAX_CLIENTS; i++)
             {
@@ -240,7 +253,7 @@ void *handle_client(void *arg)
                     snprintf(msg,
                              sizeof(msg),
                              "MSG BCAST %s %s\n",
-                             sender,
+                             clients[index].username,
                              message);
 
                     send(clients[i].socket,
@@ -317,16 +330,234 @@ void *handle_client(void *arg)
             }
         }
 
+        /* CREATE ROOM */
+        else if (strncmp(buffer, "CREATE ", 7) == 0)
+        {
+            char room_name[ROOM_NAME_SIZE];
+
+            if (sscanf(buffer + 7,
+                       "%49s",
+                       room_name) != 1)
+            {
+                send_response(client_fd,
+                              "ERR 006 INVALID_COMMAND");
+                continue;
+            }
+
+            pthread_mutex_lock(&clients_mutex);
+
+            if (find_room(room_name) != -1)
+            {
+                pthread_mutex_unlock(&clients_mutex);
+
+                send_response(client_fd,
+                              "ERR 003 ROOM_EXISTS");
+                continue;
+            }
+
+            int room_index = find_free_room();
+
+            if (room_index == -1)
+            {
+                pthread_mutex_unlock(&clients_mutex);
+
+                send_response(client_fd,
+                              "ERR 004 ROOM_LIMIT");
+                continue;
+            }
+
+            strncpy(rooms[room_index].name,
+                    room_name,
+                    ROOM_NAME_SIZE - 1);
+
+            rooms[room_index].name[ROOM_NAME_SIZE - 1] = '\0';
+            rooms[room_index].active = 1;
+
+            pthread_mutex_unlock(&clients_mutex);
+
+            send_response(client_fd,
+                          "OK ROOM_CREATED");
+        }
+
+        /* JOIN ROOM */
+        else if (strncmp(buffer, "JOIN ", 5) == 0)
+        {
+            char room_name[ROOM_NAME_SIZE];
+
+            if (sscanf(buffer + 5,
+                       "%49s",
+                       room_name) != 1)
+            {
+                send_response(client_fd,
+                              "ERR 006 INVALID_COMMAND");
+                continue;
+            }
+
+            pthread_mutex_lock(&clients_mutex);
+
+            int room_index = find_room(room_name);
+
+            if (room_index == -1)
+            {
+                pthread_mutex_unlock(&clients_mutex);
+
+                send_response(client_fd,
+                              "ERR 005 ROOM_NOT_FOUND");
+                continue;
+            }
+
+            clients[index].room_index = room_index;
+
+            pthread_mutex_unlock(&clients_mutex);
+
+            send_response(client_fd,
+                          "OK JOINED");
+        }
+
+        /* ROOMS */
+        else if (strncmp(buffer, "ROOMS", 5) == 0)
+        {
+            char room_list[BUFFER_SIZE];
+            room_list[0] = '\0';
+
+            pthread_mutex_lock(&clients_mutex);
+
+            int first_room = 1;
+
+            for (int i = 0; i < MAX_ROOMS; i++)
+            {
+                if (rooms[i].active)
+                {
+                    if (!first_room)
+                    {
+                        strncat(room_list,
+                                ",",
+                                sizeof(room_list) -
+                                strlen(room_list) - 1);
+                    }
+
+                    strncat(room_list,
+                            rooms[i].name,
+                            sizeof(room_list) -
+                            strlen(room_list) - 1);
+
+                    first_room = 0;
+                }
+            }
+
+            pthread_mutex_unlock(&clients_mutex);
+
+            char response[BUFFER_SIZE];
+
+            snprintf(response,
+                     sizeof(response),
+                     "OK ROOMS %s NID:%s\n",
+                     room_list,
+                     NID);
+
+            send(client_fd,
+                 response,
+                 strlen(response),
+                 0);
+        }
+
+        /* LEAVE ROOM */
+        else if (strncmp(buffer, "LEAVE", 5) == 0)
+        {
+            pthread_mutex_lock(&clients_mutex);
+
+            if (clients[index].room_index == -1)
+            {
+                pthread_mutex_unlock(&clients_mutex);
+
+                send_response(client_fd,
+                              "ERR 005 NOT_IN_ROOM");
+                continue;
+            }
+
+            clients[index].room_index = -1;
+
+            pthread_mutex_unlock(&clients_mutex);
+
+            send_response(client_fd,
+                          "OK LEFT");
+        }
+
+        /* ROOM MESSAGE */
+        else if (strncmp(buffer, "RMSG ", 5) == 0)
+        {
+            char room_name[ROOM_NAME_SIZE];
+            char message[BUFFER_SIZE];
+
+            if (sscanf(buffer + 5,
+                       "%49s %[^\n]",
+                       room_name,
+                       message) < 2)
+            {
+                send_response(client_fd,
+                              "ERR 006 INVALID_COMMAND");
+                continue;
+            }
+
+            pthread_mutex_lock(&clients_mutex);
+
+            int room_index = find_room(room_name);
+
+            if (room_index == -1)
+            {
+                pthread_mutex_unlock(&clients_mutex);
+
+                send_response(client_fd,
+                              "ERR 005 ROOM_NOT_FOUND");
+                continue;
+            }
+
+            if (clients[index].room_index != room_index)
+            {
+                pthread_mutex_unlock(&clients_mutex);
+
+                send_response(client_fd,
+                              "ERR 005 NOT_IN_ROOM");
+                continue;
+            }
+
+            for (int i = 0; i < MAX_CLIENTS; i++)
+            {
+                if (clients[i].registered &&
+                    clients[i].room_index == room_index &&
+                    i != index)
+                {
+                    char msg[BUFFER_SIZE];
+
+                    snprintf(msg,
+                             sizeof(msg),
+                             "MSG ROOM %s %s: %s\n",
+                             room_name,
+                             clients[index].username,
+                             message);
+
+                    send(clients[i].socket,
+                         msg,
+                         strlen(msg),
+                         0);
+                }
+            }
+
+            pthread_mutex_unlock(&clients_mutex);
+
+            send_response(client_fd,
+                          "OK SENT");
+        }
+
         /* QUIT */
         else if (strncmp(buffer, "QUIT", 4) == 0)
         {
             send_response(client_fd,
                           "OK BYE");
-
             break;
         }
 
-        /* INVALID COMMAND */
+        /* INVALID */
         else
         {
             send_response(client_fd,
@@ -346,6 +577,7 @@ void *handle_client(void *arg)
     clients[index].socket = 0;
     clients[index].registered = 0;
     clients[index].username[0] = '\0';
+    clients[index].room_index = -1;
 
     pthread_mutex_unlock(&clients_mutex);
 
@@ -358,6 +590,12 @@ int main(void)
     struct sockaddr_in server_addr;
 
     memset(clients, 0, sizeof(clients));
+    memset(rooms, 0, sizeof(rooms));
+
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        clients[i].room_index = -1;
+    }
 
     server_fd = socket(AF_INET,
                        SOCK_STREAM,
@@ -431,13 +669,13 @@ int main(void)
                           "ERR 008 SERVER_FULL");
 
             close(client_fd);
-
             continue;
         }
 
         clients[index].socket = client_fd;
         clients[index].registered = 0;
         clients[index].username[0] = '\0';
+        clients[index].room_index = -1;
 
         pthread_mutex_unlock(&clients_mutex);
 
@@ -450,13 +688,7 @@ int main(void)
         if (thread_index == NULL)
         {
             perror("malloc");
-
             close(client_fd);
-
-            pthread_mutex_lock(&clients_mutex);
-            clients[index].socket = 0;
-            pthread_mutex_unlock(&clients_mutex);
-
             continue;
         }
 
