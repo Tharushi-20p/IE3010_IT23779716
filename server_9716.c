@@ -6,15 +6,19 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #define PORT 15716
 #define BACKLOG 10
 #define BUFFER_SIZE 1024
+#define FILE_BUFFER_SIZE 4096
 #define NID "7797"
 #define MAX_CLIENTS 20
 #define MAX_ROOMS 10
 #define ROOM_NAME_SIZE 50
 #define USERNAME_SIZE 50
+#define STORAGE_PATH "./storage/IT23779716"
 
 typedef struct
 {
@@ -52,9 +56,7 @@ int find_room(const char *name)
     {
         if (rooms[i].active &&
             strcmp(rooms[i].name, name) == 0)
-        {
             return i;
-        }
     }
 
     return -1;
@@ -85,6 +87,37 @@ void send_response(int client_fd, const char *message)
          response,
          strlen(response),
          0);
+}
+
+int receive_exact_bytes(int fd, FILE *file, long long size)
+{
+    char buffer[FILE_BUFFER_SIZE];
+    long long received = 0;
+
+    while (received < size)
+    {
+        long long remaining = size - received;
+        size_t chunk = remaining < FILE_BUFFER_SIZE
+                           ? (size_t)remaining
+                           : FILE_BUFFER_SIZE;
+
+        ssize_t bytes = recv(fd,
+                             buffer,
+                             chunk,
+                             0);
+
+        if (bytes <= 0)
+            return -1;
+
+        fwrite(buffer,
+               1,
+               bytes,
+               file);
+
+        received += bytes;
+    }
+
+    return 0;
 }
 
 void *handle_client(void *arg)
@@ -146,10 +179,8 @@ void *handle_client(void *arg)
         pthread_mutex_unlock(&clients_mutex);
 
         if (duplicate)
-        {
             send_response(client_fd,
                           "ERR 001 USERNAME_TAKEN");
-        }
         else
         {
             send_response(client_fd,
@@ -319,18 +350,14 @@ void *handle_client(void *arg)
             pthread_mutex_unlock(&clients_mutex);
 
             if (target_index == -1)
-            {
                 send_response(client_fd,
                               "ERR 002 USER_NOT_FOUND");
-            }
             else
-            {
                 send_response(client_fd,
                               "OK SENT");
-            }
         }
 
-        /* CREATE ROOM */
+        /* CREATE */
         else if (strncmp(buffer, "CREATE ", 7) == 0)
         {
             char room_name[ROOM_NAME_SIZE];
@@ -379,7 +406,7 @@ void *handle_client(void *arg)
                           "OK ROOM_CREATED");
         }
 
-        /* JOIN ROOM */
+        /* JOIN */
         else if (strncmp(buffer, "JOIN ", 5) == 0)
         {
             char room_name[ROOM_NAME_SIZE];
@@ -461,7 +488,7 @@ void *handle_client(void *arg)
                  0);
         }
 
-        /* LEAVE ROOM */
+        /* LEAVE */
         else if (strncmp(buffer, "LEAVE", 5) == 0)
         {
             pthread_mutex_lock(&clients_mutex);
@@ -483,7 +510,7 @@ void *handle_client(void *arg)
                           "OK LEFT");
         }
 
-        /* ROOM MESSAGE */
+        /* RMSG */
         else if (strncmp(buffer, "RMSG ", 5) == 0)
         {
             char room_name[ROOM_NAME_SIZE];
@@ -549,6 +576,127 @@ void *handle_client(void *arg)
                           "OK SENT");
         }
 
+        /* SENDFILE */
+        else if (strncmp(buffer, "SENDFILE ", 9) == 0)
+        {
+            char target[USERNAME_SIZE];
+            char filename[256];
+            long long filesize;
+
+            if (sscanf(buffer + 9,
+                       "%49s %255s %lld",
+                       target,
+                       filename,
+                       &filesize) != 3 ||
+                filesize < 0)
+            {
+                send_response(client_fd,
+                              "ERR 006 INVALID_COMMAND");
+                continue;
+            }
+
+            int target_index = -1;
+
+            pthread_mutex_lock(&clients_mutex);
+
+            for (int i = 0; i < MAX_CLIENTS; i++)
+            {
+                if (clients[i].registered &&
+                    strcmp(clients[i].username,
+                           target) == 0)
+                {
+                    target_index = i;
+                    break;
+                }
+            }
+
+            pthread_mutex_unlock(&clients_mutex);
+
+            if (target_index == -1)
+            {
+                send_response(client_fd,
+                              "ERR 002 USER_NOT_FOUND");
+                continue;
+            }
+
+            char safe_filename[256];
+
+            strncpy(safe_filename,
+                    filename,
+                    sizeof(safe_filename) - 1);
+
+            safe_filename[sizeof(safe_filename) - 1] = '\0';
+
+            char *slash = strrchr(safe_filename, '/');
+
+            if (slash != NULL)
+                memmove(safe_filename,
+                        slash + 1,
+                        strlen(slash + 1) + 1);
+
+            char filepath[512];
+
+            snprintf(filepath,
+                     sizeof(filepath),
+                     "%s/%s",
+                     STORAGE_PATH,
+                     safe_filename);
+
+            FILE *file = fopen(filepath, "wb");
+
+            if (file == NULL)
+            {
+                perror("fopen");
+
+                send_response(client_fd,
+                              "ERR 007 FILE_ERROR");
+                continue;
+            }
+
+            printf("Receiving file: %s (%lld bytes)\n",
+                   safe_filename,
+                   filesize);
+
+            if (receive_exact_bytes(client_fd,
+                                     file,
+                                     filesize) != 0)
+            {
+                fclose(file);
+
+                send_response(client_fd,
+                              "ERR 007 FILE_ERROR");
+                continue;
+            }
+
+            fclose(file);
+
+            printf("File received successfully: %s\n",
+                   filepath);
+
+            pthread_mutex_lock(&clients_mutex);
+
+            char notification[BUFFER_SIZE];
+
+            snprintf(notification,
+                     sizeof(notification),
+                     "FILE %s %s %lld\n",
+                     clients[index].username,
+                     safe_filename,
+                     filesize);
+
+            send(target_index == index
+                     ? client_fd
+                     : clients[target_index].socket,
+                 notification,
+                 strlen(notification),
+                 0);
+
+            pthread_mutex_unlock(&clients_mutex);
+
+            send_response(client_fd,
+                          "OK FILE_SENT");
+        }
+
         /* QUIT */
         else if (strncmp(buffer, "QUIT", 4) == 0)
         {
@@ -589,13 +737,14 @@ int main(void)
     int server_fd;
     struct sockaddr_in server_addr;
 
+    mkdir("./storage", 0755);
+    mkdir(STORAGE_PATH, 0755);
+
     memset(clients, 0, sizeof(clients));
     memset(rooms, 0, sizeof(rooms));
 
     for (int i = 0; i < MAX_CLIENTS; i++)
-    {
         clients[i].room_index = -1;
-    }
 
     server_fd = socket(AF_INET,
                        SOCK_STREAM,
@@ -640,6 +789,7 @@ int main(void)
 
     printf("NetMessenger server started.\n");
     printf("Listening on TCP port %d\n", PORT);
+    printf("Storage: %s\n", STORAGE_PATH);
     printf("Waiting for clients...\n");
 
     while (1)

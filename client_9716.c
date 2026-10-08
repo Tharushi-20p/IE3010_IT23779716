@@ -6,10 +6,12 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/stat.h>
 
 #define PORT 15716
 #define SERVER_IP "127.0.0.1"
 #define BUFFER_SIZE 1024
+#define FILE_BUFFER_SIZE 4096
 
 int sock_fd;
 volatile int running = 1;
@@ -41,6 +43,112 @@ void *receive_messages(void *arg)
     }
 
     return NULL;
+}
+
+int send_file(const char *target,
+              const char *filepath)
+{
+    FILE *file = fopen(filepath, "rb");
+
+    if (file == NULL)
+    {
+        perror("fopen");
+        return -1;
+    }
+
+    struct stat file_info;
+
+    if (stat(filepath, &file_info) != 0)
+    {
+        perror("stat");
+        fclose(file);
+        return -1;
+    }
+
+    long long filesize = file_info.st_size;
+
+    const char *filename = strrchr(filepath, '/');
+
+    if (filename != NULL)
+        filename++;
+    else
+        filename = filepath;
+
+    char header[BUFFER_SIZE];
+
+    snprintf(header,
+             sizeof(header),
+             "SENDFILE %s %s %lld\n",
+             target,
+             filename,
+             filesize);
+
+    if (send(sock_fd,
+             header,
+             strlen(header),
+             0) < 0)
+    {
+        perror("send");
+        fclose(file);
+        return -1;
+    }
+
+    char file_buffer[FILE_BUFFER_SIZE];
+
+    long long sent_total = 0;
+
+    while (sent_total < filesize)
+    {
+        size_t bytes_to_read =
+            (filesize - sent_total < FILE_BUFFER_SIZE)
+                ? (size_t)(filesize - sent_total)
+                : FILE_BUFFER_SIZE;
+
+        size_t bytes_read =
+            fread(file_buffer,
+                  1,
+                  bytes_to_read,
+                  file);
+
+        if (bytes_read == 0)
+            break;
+
+        size_t total_sent = 0;
+
+        while (total_sent < bytes_read)
+        {
+            ssize_t sent =
+                send(sock_fd,
+                     file_buffer + total_sent,
+                     bytes_read - total_sent,
+                     0);
+
+            if (sent <= 0)
+            {
+                perror("send");
+                fclose(file);
+                return -1;
+            }
+
+            total_sent += sent;
+        }
+
+        sent_total += bytes_read;
+    }
+
+    fclose(file);
+
+    if (sent_total != filesize)
+    {
+        printf("File transfer incomplete.\n");
+        return -1;
+    }
+
+    printf("File sent: %s (%lld bytes)\n",
+           filename,
+           filesize);
+
+    return 0;
 }
 
 int main(void)
@@ -110,10 +218,11 @@ int main(void)
 
     memset(buffer, 0, sizeof(buffer));
 
-    ssize_t bytes_received = recv(sock_fd,
-                                  buffer,
-                                  sizeof(buffer) - 1,
-                                  0);
+    ssize_t bytes_received =
+        recv(sock_fd,
+             buffer,
+             sizeof(buffer) - 1,
+             0);
 
     if (bytes_received <= 0)
     {
@@ -126,7 +235,6 @@ int main(void)
 
     printf("Server: %s", buffer);
 
-    /* Start receiver thread */
     pthread_t receiver_thread;
 
     if (pthread_create(&receiver_thread,
@@ -139,7 +247,6 @@ int main(void)
         return 1;
     }
 
-    /* Command input */
     while (running)
     {
         printf("> ");
@@ -152,6 +259,28 @@ int main(void)
             break;
         }
 
+        if (strncmp(buffer,
+                    "SENDFILE ",
+                    9) == 0)
+        {
+            char target[50];
+            char filepath[500];
+
+            if (sscanf(buffer + 9,
+                       "%49s %499s",
+                       target,
+                       filepath) != 2)
+            {
+                printf("Usage: SENDFILE <target> <filepath>\n");
+                continue;
+            }
+
+            send_file(target,
+                      filepath);
+
+            continue;
+        }
+
         if (send(sock_fd,
                  buffer,
                  strlen(buffer),
@@ -161,7 +290,8 @@ int main(void)
             break;
         }
 
-        if (strcmp(buffer, "QUIT\n") == 0)
+        if (strcmp(buffer,
+                   "QUIT\n") == 0)
         {
             sleep(1);
             running = 0;
@@ -171,7 +301,8 @@ int main(void)
 
     running = 0;
 
-    shutdown(sock_fd, SHUT_RDWR);
+    shutdown(sock_fd,
+             SHUT_RDWR);
 
     pthread_join(receiver_thread,
                  NULL);
