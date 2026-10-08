@@ -27,9 +27,7 @@ pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int find_free_slot(void)
 {
-    int i;
-
-    for (i = 0; i < MAX_CLIENTS; i++)
+    for (int i = 0; i < MAX_CLIENTS; i++)
     {
         if (clients[i].socket == 0)
         {
@@ -64,7 +62,7 @@ void *handle_client(void *arg)
     int client_fd = clients[index].socket;
     char buffer[BUFFER_SIZE];
 
-    /* Registration */
+    /* REGISTER */
     memset(buffer, 0, sizeof(buffer));
 
     ssize_t bytes_received = recv(client_fd,
@@ -143,7 +141,7 @@ void *handle_client(void *arg)
                       "ERR 006 INVALID_COMMAND");
     }
 
-    /* Command loop */
+    /* COMMAND LOOP */
     while (1)
     {
         memset(buffer, 0, sizeof(buffer));
@@ -187,13 +185,13 @@ void *handle_client(void *arg)
                         strncat(user_list,
                                 ",",
                                 sizeof(user_list) -
-                                    strlen(user_list) - 1);
+                                strlen(user_list) - 1);
                     }
 
                     strncat(user_list,
                             clients[i].username,
                             sizeof(user_list) -
-                                strlen(user_list) - 1);
+                            strlen(user_list) - 1);
 
                     first_user = 0;
                 }
@@ -258,6 +256,67 @@ void *handle_client(void *arg)
                           "OK SENT");
         }
 
+        /* PMSG */
+        else if (strncmp(buffer, "PMSG ", 5) == 0)
+        {
+            char target[USERNAME_SIZE];
+            char message[BUFFER_SIZE];
+
+            if (sscanf(buffer + 5,
+                       "%49s %[^\n]",
+                       target,
+                       message) < 2)
+            {
+                send_response(client_fd,
+                              "ERR 006 INVALID_COMMAND");
+                continue;
+            }
+
+            int target_index = -1;
+
+            pthread_mutex_lock(&clients_mutex);
+
+            for (int i = 0; i < MAX_CLIENTS; i++)
+            {
+                if (clients[i].registered &&
+                    strcmp(clients[i].username,
+                           target) == 0)
+                {
+                    target_index = i;
+                    break;
+                }
+            }
+
+            if (target_index != -1)
+            {
+                char msg[BUFFER_SIZE];
+
+                snprintf(msg,
+                         sizeof(msg),
+                         "MSG PMSG %s %s\n",
+                         clients[index].username,
+                         message);
+
+                send(clients[target_index].socket,
+                     msg,
+                     strlen(msg),
+                     0);
+            }
+
+            pthread_mutex_unlock(&clients_mutex);
+
+            if (target_index == -1)
+            {
+                send_response(client_fd,
+                              "ERR 002 USER_NOT_FOUND");
+            }
+            else
+            {
+                send_response(client_fd,
+                              "OK SENT");
+            }
+        }
+
         /* QUIT */
         else if (strncmp(buffer, "QUIT", 4) == 0)
         {
@@ -267,7 +326,7 @@ void *handle_client(void *arg)
             break;
         }
 
-        /* Unknown command */
+        /* INVALID COMMAND */
         else
         {
             send_response(client_fd,
@@ -333,7 +392,8 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, BACKLOG) < 0)
+    if (listen(server_fd,
+               BACKLOG) < 0)
     {
         perror("listen");
         close(server_fd);
@@ -390,6 +450,7 @@ int main(void)
         if (thread_index == NULL)
         {
             perror("malloc");
+
             close(client_fd);
 
             pthread_mutex_lock(&clients_mutex);
