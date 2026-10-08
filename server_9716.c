@@ -40,6 +40,22 @@ int find_free_slot(void)
     return -1;
 }
 
+void send_response(int client_fd, const char *message)
+{
+    char response[BUFFER_SIZE];
+
+    snprintf(response,
+             sizeof(response),
+             "%s NID:%s\n",
+             message,
+             NID);
+
+    send(client_fd,
+         response,
+         strlen(response),
+         0);
+}
+
 void *handle_client(void *arg)
 {
     int index = *(int *)arg;
@@ -48,6 +64,7 @@ void *handle_client(void *arg)
     int client_fd = clients[index].socket;
     char buffer[BUFFER_SIZE];
 
+    /* Registration */
     memset(buffer, 0, sizeof(buffer));
 
     ssize_t bytes_received = recv(client_fd,
@@ -106,46 +123,27 @@ void *handle_client(void *arg)
 
         pthread_mutex_unlock(&clients_mutex);
 
-        char response[128];
-
         if (duplicate)
         {
-            snprintf(response,
-                     sizeof(response),
-                     "ERR 001 USERNAME_TAKEN NID:%s\n",
-                     NID);
+            send_response(client_fd,
+                          "ERR 001 USERNAME_TAKEN");
         }
         else
         {
-            snprintf(response,
-                     sizeof(response),
-                     "OK REGISTERED NID:%s\n",
-                     NID);
+            send_response(client_fd,
+                          "OK REGISTERED");
 
             printf("User registered: %s\n",
                    username);
         }
-
-        send(client_fd,
-             response,
-             strlen(response),
-             0);
     }
     else
     {
-        char response[128];
-
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 006 INVALID_COMMAND NID:%s\n",
-                 NID);
-
-        send(client_fd,
-             response,
-             strlen(response),
-             0);
+        send_response(client_fd,
+                      "ERR 006 INVALID_COMMAND");
     }
 
+    /* Command loop */
     while (1)
     {
         memset(buffer, 0, sizeof(buffer));
@@ -168,6 +166,7 @@ void *handle_client(void *arg)
                    : "UNKNOWN",
                buffer);
 
+        /* LIST */
         if (strncmp(buffer, "LIST", 4) == 0)
         {
             char user_list[BUFFER_SIZE];
@@ -208,14 +207,71 @@ void *handle_client(void *arg)
                      user_list,
                      NID);
 
-            ssize_t sent = send(client_fd,
-                                response,
-                                strlen(response),
-                                0);
+            send(client_fd,
+                 response,
+                 strlen(response),
+                 0);
+        }
 
-            printf("LIST response sent: %zd bytes: %s",
-                   sent,
-                   response);
+        /* BCAST */
+        else if (strncmp(buffer, "BCAST ", 6) == 0)
+        {
+            char message[BUFFER_SIZE];
+
+            strcpy(message, buffer + 6);
+
+            message[strcspn(message, "\n")] = '\0';
+
+            pthread_mutex_lock(&clients_mutex);
+
+            char sender[USERNAME_SIZE];
+
+            strncpy(sender,
+                    clients[index].username,
+                    USERNAME_SIZE - 1);
+
+            sender[USERNAME_SIZE - 1] = '\0';
+
+            for (int i = 0; i < MAX_CLIENTS; i++)
+            {
+                if (clients[i].registered &&
+                    i != index)
+                {
+                    char msg[BUFFER_SIZE];
+
+                    snprintf(msg,
+                             sizeof(msg),
+                             "MSG BCAST %s %s\n",
+                             sender,
+                             message);
+
+                    send(clients[i].socket,
+                         msg,
+                         strlen(msg),
+                         0);
+                }
+            }
+
+            pthread_mutex_unlock(&clients_mutex);
+
+            send_response(client_fd,
+                          "OK SENT");
+        }
+
+        /* QUIT */
+        else if (strncmp(buffer, "QUIT", 4) == 0)
+        {
+            send_response(client_fd,
+                          "OK BYE");
+
+            break;
+        }
+
+        /* Unknown command */
+        else
+        {
+            send_response(client_fd,
+                          "ERR 006 INVALID_COMMAND");
         }
     }
 
@@ -256,16 +312,11 @@ int main(void)
 
     int opt = 1;
 
-    if (setsockopt(server_fd,
-                   SOL_SOCKET,
-                   SO_REUSEADDR,
-                   &opt,
-                   sizeof(opt)) < 0)
-    {
-        perror("setsockopt");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
+    setsockopt(server_fd,
+               SOL_SOCKET,
+               SO_REUSEADDR,
+               &opt,
+               sizeof(opt));
 
     memset(&server_addr, 0, sizeof(server_addr));
 
@@ -316,17 +367,8 @@ int main(void)
         {
             pthread_mutex_unlock(&clients_mutex);
 
-            char response[128];
-
-            snprintf(response,
-                     sizeof(response),
-                     "ERR 008 SERVER_FULL NID:%s\n",
-                     NID);
-
-            send(client_fd,
-                 response,
-                 strlen(response),
-                 0);
+            send_response(client_fd,
+                          "ERR 008 SERVER_FULL");
 
             close(client_fd);
 
@@ -348,13 +390,10 @@ int main(void)
         if (thread_index == NULL)
         {
             perror("malloc");
-
             close(client_fd);
 
             pthread_mutex_lock(&clients_mutex);
-
             clients[index].socket = 0;
-
             pthread_mutex_unlock(&clients_mutex);
 
             continue;
@@ -375,9 +414,7 @@ int main(void)
             close(client_fd);
 
             pthread_mutex_lock(&clients_mutex);
-
             clients[index].socket = 0;
-
             pthread_mutex_unlock(&clients_mutex);
 
             continue;
